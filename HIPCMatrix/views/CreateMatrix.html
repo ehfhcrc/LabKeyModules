@@ -176,8 +176,8 @@ function renderPanel()
             xtype: 'combobox',
             name: 'featureSet',
             fieldLabel: 'Feature Annotation Set',
-            //allowBlank: false,
-            allowBlank: true,
+            allowBlank: false,
+            //allowBlank: true,
             valueField: 'RowId',
             displayField: 'Name',
             store: Ext4.create('LABKEY.ext4.data.Store', {
