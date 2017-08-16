@@ -1,67 +1,68 @@
-library(data.table)
+library(ImmuneSpaceR)
 library(Rlabkey)
-library(tools)
+library(data.table)
+library(Biobase) # why are we loading library AND doing @importFrom?
+library(tools) # why are we loading library AND doing @importFrom?
 
 # read the job info
 jobInfo <- read.table("${pipeline, taskInfo}",
                       col.names=c("name", "value", "type"),
-                      header=FALSE, check.names=FALSE,
-                      stringsAsFactors=FALSE, sep="\t", quote="",
-                      fill=TRUE, na.strings="")
+                      header=FALSE,
+                      check.names=FALSE,
+                      stringsAsFactors=FALSE,
+                      sep="\t",
+                      quote="",
+                      fill=TRUE,
+                      na.strings="")
+
 ## Handle ALL inputs (useful for working locally on the code)
 labkey.url.base <- jobInfo$value[jobInfo$name == "baseUrl"]
 labkey.url.path <- jobInfo$value[jobInfo$name == "containerPath"]
 pipeline.root   <- jobInfo$value[jobInfo$name == "pipeRoot"]
 inputFiles      <- jobInfo$value[ grep("input\\.", jobInfo$name)]
 
-
 selectedBiosamples <- selectedGEOs <- NULL
 # From LABKEY.Pipeline.startAnalysis in views/CreateMatrix.html
 selectedBiosamples <- "${selected-biosamples}"
 selectedGEOs <- "${selected-GEOs}"
 
-library(ImmuneSpaceR)
-library(Biobase)
-library(tools)
-library(Rlabkey)
-library(data.table)
-
 ################################################
 ###             HELPER FN                    ###
 ################################################
 
-setGEO <- function(gef, inputFiles){
+setGEO <- function(GEOs, gef, con, inputFiles){
   # TEMPORARY list of studies where GEO should be avoided
   noGEO <- c("SDY224")
   
   # Decide whether we use GEO or the files
-  if(all(GEOs %in% gef$geo_accession) & !con$study %in% noGEO){
-    isGEO <- TRUE
-  } else if(all(basename(inputFiles) %in% gef$file_info_name)){
-    isGEO <- FALSE
+  if( all(GEOs %in% gef$geo_accession) & !con$study %in% noGEO ){
+    return(TRUE)
+  } else if( all(basename(inputFiles) %in% gef$file_info_name) ){
+    return(FALSE)
   } else{
     stop("Could not decide between GEO and files. Check selected rows to make sure that all selected rows have a file or they all have a GEO accession number.")
   }
-  
-  return(isGEO)
 }
 
 #' @importFrom preprocessCore normalize.quantiles
-logNorm <- function(exprs){
+logNorm <- function(norm_exprs){
   # Norm process removes col / rownames
-  rnames <- exprs[ , feature_id]
-  exprs <- exprs[ , feature_id := NULL]
-  cnames <- colnames(exprs)
-  norm_exprs <- preprocessCore::normalize.quantiles(as.matrix(exprs))
+  rnames <- norm_exprs[ , feature_id ]
+  norm_exprs[ , feature_id := NULL]
+  cnames <- colnames(tmp)
+  norm_exprs <- preprocessCore::normalize.quantiles(as.matrix(norm_exprs))
   colnames(norm_exprs) <- cnames
   
   # pmax ensures that no values are below 1, which would generate neg numbers when log2
-  norm_exprs <- pmax(exprs, 1)
+  norm_exprs <- pmax(norm_exprs, 1)
   
   # if NOT rna-seq, then log2, handle NAs? Yes, for now.
-  if( max(norm_exprs, na.rm = T) > 100 ){ log2(norm_exprs) } 
+  if( max(norm_exprs, na.rm = T) > 100 ){ norm_exprs <- log2(norm_exprs) }
+
+  # need to do this last b/c need probes as col, not rownames and want dt output
+  norm_exprs <- data.table(norm_exprs)
+  norm_exprs[, feature_id := rnames ]
   
-  norm_exprs[["feature_id"]] <- rnames # need to do this last b/c need as col, not rownames
   return(norm_exprs)
 }
 
@@ -93,16 +94,17 @@ logNorm <- function(exprs){
 # Returns a data.table with a feature_id column and one column per expsample_accession
 #' @importFrom Biobase exprs sampleNames
 .process_GEO <- function(gef){
-  gef <- gef[geo_accession != ""] #Make sure we only have rows with GEO.
+  gef <- gef[geo_accession != ""] # Make sure we only have rows with GEO.
   gsm <- getGEO(gef[1, geo_accession])
-  gse <- gsm@header$series_id[1] #Assumes that the serie is the first one (SuperSeries with higher ID)
+  gse <- gsm@header$series_id[1] # Assumes seriesID is the first one (SuperSeries with higher ID)
   es <- getGEO(gse)[[1]]
   es <- es[, sampleNames(es) %in% gef$geo_accession]
-  if(all(gef$geo_accession %in% sampleNames(es))){ #All selected samples are in the series
+  if( all(gef$geo_accession %in% sampleNames(es)) ){ # All selected samples are in the series
     #sampleNames are GEO accession
     sampleNames(es) <- gef[match(sampleNames(es), geo_accession), expsample_accession] 
     exprs <- data.table(exprs(es))
     exprs <- exprs[, feature_id := featureNames(es)]
+    cnames <- colnames(exprs)[ colnames(exprs) != "feature_id"] # b/c dt is by ref!
     setcolorder(exprs, c("feature_id", cnames))
   } else{
     stop(paste0("Some of the selected gene_expression_files rows are not part of ",
@@ -156,7 +158,7 @@ logNorm <- function(exprs){
   return(exprs)
 }
 
-# biosample_accession as colnames
+# biosample_accession as colnames instead of experiment sample
 # Works for SDY212 & 162
 .process_others <- function(gef, inputFiles){
   
@@ -223,8 +225,7 @@ makeMatrix <- function(gef, isGEO, con){
     library(GEOquery)
     exprs <- .process_GEO(gef)
   }else{
-    # Do we really need to remake inputFiles here?
-    inputFiles <- unique(gef$file_info_name)
+    inputFiles <- unique(gef$file_info_name) # why not use the global via arg?
     ext <- unique(file_ext(inputFiles))
     inputFiles <- file.path("/share/files/",
                             con$config$labkey.url.path,
@@ -251,7 +252,6 @@ makeMatrix <- function(gef, isGEO, con){
       exprs <- data.table(exprs, keep.rownames = TRUE)
       setnames(exprs, "rn", "feature_id")
     }
-    # This step should eventually be removed as we move from biosample to expsample
   }
   
   # map experiment samplenames to biosample names
@@ -259,10 +259,11 @@ makeMatrix <- function(gef, isGEO, con){
 }
 
 summarizeMatrix <- function(norm_exprs, f2g){
-  em <- data.table(norm_exprs)
-  em[ , gene_symbol := f2g[match(em$feature_id, f2g$featureid), genesymbol] ]
-  em <- em[ !is.na(gene_symbol) & gene_symbol != "NA"]
-  em <- em[ ,lapply(.SD, mean), by="gene_symbol", .SDcols = grep("^BS", colnames(em))]
+  norm_exprs[ , gene_symbol := f2g[match(norm_exprs$feature_id, f2g$featureid), genesymbol] ]
+  norm_exprs <- norm_exprs[ !is.na(gene_symbol) & gene_symbol != "NA"]
+  norm_exprs <- norm_exprs[ ,lapply(.SD, mean),
+                            by="gene_symbol",
+                            .SDcols = grep("^BS", colnames(norm_exprs))]
 }
 
 writeMatrix <- function(pipeline.root, exprs, bygene){
@@ -307,32 +308,31 @@ f2g <- data.table(labkey.selectRows(baseUrl = labkey.url.base,
                                     colNameOpt = "rname", 
                                     colSelect = c("featureid", "genesymbol")))
 
-if(nrow(f2g) == 0){
-  stop("The downloaded feature annotation set has 0 rows.")
-}
+if(nrow(f2g) == 0){ stop("The downloaded feature annotation set has 0 rows.") }
 
-con <- CreateConnection()
+con <- CreateConnection() # sdy specific b/c labkey.url.path
 
 # Subset gef according to inputFiles or GEO
-inputFiles <- inputFiles[file.exists(inputFiles)]
-GEOs <- unlist(strsplit(selectedGEOs, ","))
 filter <- makeFilter(c("biosample_accession", "IN", gsub(",", ";", selectedBiosamples)))
 gef <- con$getDataset("gene_expression_files", 
                       colFilter = filter, 
                       original_view = TRUE, 
                       reload = TRUE)
+inputFiles <- inputFiles[file.exists(inputFiles)]
+GEOs <- unlist(strsplit(selectedGEOs, ","))
 gef <- gef[file_info_name %in% basename(inputFiles) | geo_accession %in% GEOs]
 
 # decide whether to use GEO
-isGEO <- setGEO(gef, inputFiles)
+isGEO <- setGEO(GEOs, gef, con, inputFiles)
 
 # want probe level to be non-normalized so user can have access to true rawdata
-# output (exprs) is a data.table with "feature_id" for probe names as col, not rownames
-exprs <- makeMatrix(gef, isGEO, con)
+# output (exprs) is a data.table with "feature_id" as col, not rownames
+exprs <- makeMatrix(gef, isGEO, con) # > dt output
 
 # normalize (if not RNA-seq) and summary by gene 
-if( unique(file_ext(inputFiles)) != "CEL" ){ exprs <- logNorm(exprs) } # dt > matrix
-bygene <- summarizeMatrix(exprs, f2g) # matrix > dt
+norm_exprs <- copy(exprs) # need to keep exprs safe from data.table by-ref changes!
+if( unique(file_ext(inputFiles)) != "CEL" ){ norm_exprs <- logNorm(norm_exprs) } # dt > matrix > dt
+bygene <- summarizeMatrix(norm_exprs, f2g) # dt expected and output
 
 writeMatrix(pipeline.root, exprs, bygene)
 
